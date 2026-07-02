@@ -2,6 +2,19 @@
 
 An **ESP32-C3** that acts as a Bluetooth Low Energy **keyboard + mouse**, controlled over WiFi from any browser. Hosts its own captive-portal access point *and* joins your home network, so you can drive the HID from a phone or laptop with no app to install.
 
+<p align="center">
+  <img src="docs/ui-hero.png" alt="Wireless HID web control panel" width="340">
+</p>
+
+<details>
+<summary><b>Full control panel screenshot</b></summary>
+
+<p align="center">
+  <img src="docs/ui-full.png" alt="Full Wireless HID control panel" width="420">
+</p>
+
+</details>
+
 ## Features
 
 - **BLE HID** (NimBLE) — types text, presses keys/combos, moves/clicks/scrolls the mouse on a paired device
