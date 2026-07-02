@@ -1,0 +1,8 @@
+# Build artifacts (compiled firmware embeds the AP password)
+.pio/
+.vscode/
+*.bin
+*.elf
+
+# Local secrets — never commit
+src/secrets.h
