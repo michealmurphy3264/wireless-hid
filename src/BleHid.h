@@ -164,12 +164,17 @@ public:
         _releaseKeyboard();
     }
 
+    // Type a single ASCII character (unsupported characters are skipped)
+    void typeChar(char c) {
+        uint8_t key = _asciiToKeycode(c);
+        uint8_t mod = _asciiNeedsShift(c) ? KEY_MOD_LSHIFT : 0;
+        if (key) keyPress(key, mod);
+    }
+
     // Type an ASCII string
     void typeString(const char* str) {
         for (int i = 0; str[i]; i++) {
-            uint8_t key = _asciiToKeycode(str[i]);
-            uint8_t mod = _asciiNeedsShift(str[i]) ? KEY_MOD_LSHIFT : 0;
-            if (key) keyPress(key, mod);
+            typeChar(str[i]);
             delay(20);
         }
     }

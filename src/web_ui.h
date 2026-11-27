@@ -93,6 +93,30 @@ label{font-size:13px;color:#aaa;cursor:pointer;display:flex;align-items:center;g
   </div>
 </div>
 
+<!-- SEQUENCES -->
+<div class="card">
+  <h2>Sequences</h2>
+  <p style="font-size:11px;color:#888;margin-bottom:8px">Types each row, then waits before the next. Runs on the device, so it keeps going if this page closes. <code>\n</code> = Enter, <code>\t</code> = Tab. Saved on the device automatically.</p>
+  <div class="ctrl">
+    <select id="seqSel" onchange="seqSelect(+this.value)" style="background:#2a2a2a;color:#eee;border:1px solid #444;padding:5px 8px;border-radius:4px;max-width:140px"></select>
+    <input type="text" id="seqName" placeholder="Name..." autocomplete="off" oninput="seqEdit()" style="width:0;flex:1;min-width:0;background:#1a1a2e;color:#eee;border:1px solid #444;border-radius:6px;padding:6px 8px;font-size:12px">
+    <label title="Show / hide row text"><input type="checkbox" id="seqShow" onchange="seqRender()"> Show</label>
+  </div>
+  <div id="seqRows" style="display:flex;flex-direction:column;gap:5px;margin-bottom:8px"></div>
+  <div class="row">
+    <button onclick="seqAddRow()">+ Add row</button>
+    <span style="font-size:13px;color:#aaa;align-self:center;margin-left:auto">Repeat</span>
+    <input type="number" id="seqReps" min="1" max="999" value="1" oninput="seqEdit()">
+    <span style="font-size:13px;color:#aaa;align-self:center">&times;</span>
+  </div>
+  <div class="row">
+    <button id="seqRunBtn" class="key" onclick="seqRun(seqCur)">&#9654; Run <small style="opacity:.6">[Ctrl+Shift+Enter]</small></button>
+    <button id="seqStopBtn" onclick="seqStopRun()" style="background:#7a2020">&#9632; Stop <small style="opacity:.6">[Ctrl+Shift+X]</small></button>
+  </div>
+  <div id="seqStat" style="font-size:12px;color:#aaa;min-height:16px;margin-top:4px"></div>
+  <div style="font-size:11px;color:#666;margin-top:2px">Ctrl+Shift+F1&ndash;F5 runs sequence 1&ndash;5 directly.</div>
+</div>
+
 <!-- MOUSE -->
 <div class="card">
   <h2>Mouse</h2>
@@ -295,6 +319,211 @@ function saveNick(n){ localStorage.setItem('macroname'+n, document.getElementByI
 function saveMacro(n){ localStorage.setItem('macro'+n, document.getElementById('macro'+n).value); }
 function sendMacro(n){ var t=document.getElementById('macro'+n).value; if(t) cmd('TYPE '+t); }
 
+// ---- Sequences (stored on the device, run by the firmware) ----
+var SEQ_N=5, seqs=[], seqCur=1, seqSaveT=null, seqPending={};
+var seqLoaded=false, seqLoading=false, seqState=null, seqWasRunning=false;
+
+function seqBlank(){ return {name:'', reps:1, rows:[{t:'', d:1}]}; }
+
+// Wire format — must match seqParse() in main.cpp
+function seqEncode(s){
+  if(!s.name && s.rows.every(function(r){ return !r.t; })) return '';
+  return 'v1\n'+encodeURIComponent(s.name)+'\n'+s.reps+'\n'+s.rows.map(function(r){
+    return Math.max(0, Math.round((+r.d||0)*1000))+' '+encodeURIComponent(r.t);
+  }).join('\n');
+}
+function seqDecode(b){
+  var L=b.split('\n');
+  if(L[0]!=='v1') return seqBlank();
+  var s={name:decodeURIComponent(L[1]||''), reps:Math.max(1, parseInt(L[2])||1), rows:[]};
+  for(var i=3;i<L.length;i++){
+    if(!L[i]) continue;
+    var sp=L[i].indexOf(' ');
+    s.rows.push({d:(parseInt(L[i].slice(0,sp))||0)/1000, t:decodeURIComponent(L[i].slice(sp+1))});
+  }
+  if(!s.rows.length) s.rows.push({t:'', d:1});
+  return s;
+}
+
+async function seqLoad(){
+  seqLoading=true;
+  seqMsg('Loading sequences...', '#888');
+  try{
+    var r=await fetch('/seq');
+    var parts=(await r.text()).split('\x1e');
+    for(var i=0;i<SEQ_N;i++){
+      try{ seqs[i]=parts[i] ? seqDecode(parts[i]) : seqBlank(); }catch(e){ seqs[i]=seqBlank(); }
+    }
+    seqLoaded=true;
+    seqMsg('', '#aaa');
+  }catch(e){
+    for(var i=0;i<SEQ_N;i++) seqs[i]=seqs[i]||seqBlank();
+    seqMsg('Could not load sequences — retrying...', '#e74c3c');
+  }
+  seqLoading=false;
+  try{ seqCur=Math.min(SEQ_N, Math.max(1, +localStorage.getItem('seqCur')||1)); }catch(e){}
+  seqSelect(seqCur);
+}
+
+function seqMsg(t, col){ var el=document.getElementById('seqStat'); el.textContent=t; el.style.color=col||'#aaa'; }
+
+function seqOptions(){
+  var sel=document.getElementById('seqSel');
+  sel.innerHTML='';
+  for(var i=1;i<=SEQ_N;i++){
+    var o=document.createElement('option');
+    o.value=i;
+    o.textContent=i+': '+((seqs[i-1]&&seqs[i-1].name)||'(empty)');
+    sel.appendChild(o);
+  }
+  sel.value=seqCur;
+}
+
+function seqSelect(n){
+  seqCur=n;
+  try{ localStorage.setItem('seqCur', n); }catch(e){}
+  seqOptions();
+  seqRender();
+}
+
+function seqBtn(lbl, fn, dis){
+  var b=document.createElement('button');
+  b.textContent=lbl; b.onclick=fn; b.disabled=dis;
+  b.style.cssText='padding:5px 8px;font-size:12px';
+  return b;
+}
+
+function seqRender(){
+  var s=seqs[seqCur-1]; if(!s) return;
+  document.getElementById('seqName').value=s.name;
+  document.getElementById('seqReps').value=s.reps;
+  var show=document.getElementById('seqShow').checked;
+  var wrap=document.getElementById('seqRows');
+  wrap.innerHTML='';
+  s.rows.forEach(function(r, i){
+    var row=document.createElement('div');
+    row.className='seqRow'; row.id='seqRow'+i;
+    row.style.cssText='display:flex;gap:4px;align-items:center;border-left:3px solid transparent;padding-left:3px';
+    var num=document.createElement('span');
+    num.textContent=i+1;
+    num.style.cssText='font-size:11px;color:#666;width:14px;text-align:right;flex:0 0 14px';
+    var t=document.createElement('input');
+    t.type=show?'text':'password'; t.value=r.t; t.placeholder='Text to type...'; t.autocomplete='off';
+    t.style.cssText=INP;
+    t.oninput=function(){ r.t=t.value; seqEdit(); };
+    var d=document.createElement('input');
+    d.type='number'; d.min='0'; d.step='0.1'; d.value=r.d; d.title='Wait after this row (seconds)';
+    d.style.width='58px';
+    d.oninput=function(){ r.d=Math.max(0, parseFloat(d.value)||0); seqEdit(); };
+    var unit=document.createElement('span');
+    unit.textContent='s'; unit.style.cssText='font-size:11px;color:#888';
+    row.append(num, t, d, unit,
+      seqBtn('↑', function(){ seqMove(i,-1); }, i===0),
+      seqBtn('↓', function(){ seqMove(i,1); }, i===s.rows.length-1),
+      seqBtn('✕', function(){ seqDel(i); }, false));
+    wrap.appendChild(row);
+  });
+  seqHighlight();
+}
+
+function seqAddRow(){
+  var s=seqs[seqCur-1]; if(!s) return;
+  s.rows.push({t:'', d:s.rows.length ? s.rows[s.rows.length-1].d : 1});
+  seqRender(); seqDirty(seqCur);
+  var ins=document.querySelectorAll('#seqRow'+(s.rows.length-1)+' input');
+  if(ins[0]) ins[0].focus();
+}
+function seqMove(i, dir){
+  var r=seqs[seqCur-1].rows, j=i+dir;
+  if(j<0||j>=r.length) return;
+  var tmp=r[i]; r[i]=r[j]; r[j]=tmp;
+  seqRender(); seqDirty(seqCur);
+}
+function seqDel(i){
+  var r=seqs[seqCur-1].rows;
+  r.splice(i,1);
+  if(!r.length) r.push({t:'', d:1});
+  seqRender(); seqDirty(seqCur);
+}
+
+function seqEdit(){
+  var s=seqs[seqCur-1]; if(!s) return;
+  s.name=document.getElementById('seqName').value;
+  s.reps=Math.max(1, Math.min(999, parseInt(document.getElementById('seqReps').value)||1));
+  seqOptions();
+  seqDirty(seqCur);
+}
+
+function seqDirty(n){
+  if(!seqLoaded) return;   // never overwrite device data we failed to load
+  seqPending[n]=1;
+  clearTimeout(seqSaveT);
+  seqSaveT=setTimeout(seqFlush, 600);
+  if(!(seqState&&seqState.run)) seqMsg('Saving...', '#888');
+}
+
+async function seqFlush(){
+  clearTimeout(seqSaveT);
+  var ok=true;
+  for(var n in seqPending){
+    delete seqPending[n];
+    try{
+      var r=await fetch('/seq/save', {method:'POST', body:n+'\n'+seqEncode(seqs[n-1])});
+      var j=await r.json();
+      if(!j.ok){
+        ok=false;
+        seqMsg(j.error==='TOO_LONG' ? 'Sequence '+n+' is too long to save — shorten or remove rows' : 'Save failed: '+j.error, '#e74c3c');
+      }
+    }catch(e){
+      ok=false; seqPending[n]=1;
+      seqMsg('Save failed (device offline?)', '#e74c3c');
+    }
+  }
+  if(ok && !(seqState&&seqState.run)) seqMsg('Saved', '#2ecc71');
+  return ok;
+}
+
+async function seqRun(n){
+  if(!seqLoaded) return;
+  if(Object.keys(seqPending).length && !(await seqFlush())) return;
+  var r=await cmdHttp('SEQ RUN '+n);
+  if(!r.ok){ seqMsg(r.error==='NOT_CONNECTED' ? 'BLE not connected' : 'Could not start', '#e74c3c'); return; }
+  if(r.result!=='OK:SEQ_RUN'){
+    seqMsg(r.result==='ERR:SEQ_EMPTY' ? 'Sequence '+n+' is empty' : r.result, '#e74c3c');
+    return;
+  }
+  seqWasRunning=true;
+  seqState={run:true, slot:n, row:0, rows:0, rep:0, reps:1, wait:false, left:0};
+  pollStatus();
+}
+function seqStopRun(){ cmd('SEQ STOP').then(pollStatus); }
+
+function seqShowState(){
+  var q=seqState; if(!q) return;
+  if(q.run){
+    seqWasRunning=true;
+    var nm=(seqs[q.slot-1]&&seqs[q.slot-1].name) || ('sequence '+q.slot);
+    var txt='Running '+nm+': row '+(q.row+1)+'/'+q.rows
+      +(q.reps>1 ? ' · pass '+(q.rep+1)+'/'+q.reps : '')
+      +(q.wait ? ' · waiting '+(q.left/1000).toFixed(1)+'s' : ' · typing');
+    seqMsg(txt, '#7c83fd');
+  } else if(seqWasRunning){
+    seqWasRunning=false;
+    if(q.res==='done') seqMsg('Finished', '#2ecc71');
+    else seqMsg(q.res==='disconnected' ? 'Stopped: BLE disconnected' : 'Stopped', '#e67e22');
+  }
+  seqHighlight();
+}
+function seqHighlight(){
+  document.querySelectorAll('.seqRow').forEach(function(el){ el.style.borderLeftColor='transparent'; });
+  if(seqState && seqState.run && seqState.slot===seqCur){
+    var el=document.getElementById('seqRow'+seqState.row);
+    if(el) el.style.borderLeftColor='#7c83fd';
+  }
+}
+// Poll faster while a sequence runs, for a live countdown
+setInterval(function(){ if(seqState && seqState.run) pollStatus(); }, 500);
+
 document.getElementById('txt').addEventListener('keydown', function(e){
   if(e.key==='Enter' && e.altKey){
     // Alt+Enter — insert newline
@@ -302,7 +531,7 @@ document.getElementById('txt').addEventListener('keydown', function(e){
     var t=e.target, s=t.selectionStart, v=t.value;
     t.value=v.substring(0,s)+'\n'+v.substring(t.selectionEnd);
     t.selectionStart=t.selectionEnd=s+1;
-  } else if(e.key==='Enter'){
+  } else if(e.key==='Enter' && !(e.ctrlKey && e.shiftKey)){   // Ctrl+Shift+Enter runs a sequence
     e.preventDefault();
     sendText();
   }
@@ -350,6 +579,10 @@ async function pollStatus(){
     if(typeof d.jiggleRand !== 'undefined') document.getElementById('jigRand').checked = d.jiggleRand;
     if(typeof d.msUntilJiggle !== 'undefined'){ window._jigMs=d.msUntilJiggle; window._jigAt=Date.now(); window._jigCnt=d.jiggleCount||0; }
     if(d.jiggleHistory) renderJigTrend(d.jiggleHistory);
+
+    // Sequences
+    if(!seqLoaded && !seqLoading) seqLoad();
+    if(d.seq){ seqState=d.seq; seqShowState(); }
 
     // Disable BLE-dependent buttons when disconnected or drawing
     var dis = !c || drawing;
@@ -500,6 +733,18 @@ document.addEventListener('keydown', function(e){
   if(e.ctrlKey && e.shiftKey && /^Digit[1-5]$/.test(e.code)){
     e.preventDefault(); e.stopPropagation();
     sendMacro(parseInt(e.code[5])); return;
+  }
+  if(e.ctrlKey && e.shiftKey && e.key==='Enter'){
+    e.preventDefault(); e.stopPropagation();
+    seqRun(seqCur); return;
+  }
+  if(e.ctrlKey && e.shiftKey && /^F[1-5]$/.test(e.code)){
+    e.preventDefault(); e.stopPropagation();
+    seqRun(parseInt(e.code[1])); return;
+  }
+  if(e.ctrlKey && e.shiftKey && e.code==='KeyX'){
+    e.preventDefault(); e.stopPropagation();
+    seqStopRun(); return;
   }
 
   // Passthrough keyboard forwarding

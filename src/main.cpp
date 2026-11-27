@@ -7,7 +7,7 @@
 #include <Preferences.h>
 #include "esp_netif.h"
 #include "BleHid.h"
-#include "web_ui.h"
+#include "web_ui_gz.h"  // generated from web_ui.h by tools/gzip_ui.py at build time
 #include "secrets.h"   // AP_SSID / AP_PASS — gitignored; copy from secrets.h.example
 
 BleHid           hid;
@@ -41,6 +41,158 @@ void saveJiggle() {
     prefs.end();
 }
 
+// ---------------------------------------------------------------------------
+// Sequences — typed text rows with a pause after each, run by the firmware so
+// they keep going when the browser tab sleeps or closes.
+//
+// Stored in NVS namespace "seqs", keys "s1".."s5", one string per sequence:
+//   v1
+//   <name, percent-encoded>
+//   <repeat count>
+//   <delayMs> <text, percent-encoded>     (one line per row)
+// ---------------------------------------------------------------------------
+#define SEQ_SLOTS        5
+#define SEQ_MAX_ROWS     50
+#define SEQ_MAX_BLOB     3900   // NVS strings are limited to ~4000 bytes
+#define SEQ_CHAR_GAP_MS  20     // gap between characters, as typeString()
+
+struct SeqRow { uint32_t delayMs; String text; };
+
+std::vector<SeqRow> seqRows;            // in-memory copy of the running sequence
+bool     seqRunning   = false;
+int      seqSlot      = 0;              // 1..SEQ_SLOTS
+size_t   seqRow       = 0;
+size_t   seqChar      = 0;
+int      seqRep       = 0;
+int      seqReps      = 1;
+bool     seqWaiting   = false;
+uint32_t seqWaitStart = 0;
+uint32_t seqWaitMs    = 0;
+uint32_t seqLastChar  = 0;
+String   seqResult    = "";             // running | done | stopped | disconnected
+
+static int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+String pctDecode(const String& s) {
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        if (s[i] == '%' && i + 2 < s.length()) {
+            int h = hexVal(s[i + 1]), l = hexVal(s[i + 2]);
+            if (h >= 0 && l >= 0) { out += (char)(h * 16 + l); i += 2; continue; }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+String seqKey(int slot) { return "s" + String(slot); }
+
+String seqLoadBlob(int slot) {
+    prefs.begin("seqs", true);
+    String b = prefs.isKey(seqKey(slot).c_str()) ? prefs.getString(seqKey(slot).c_str(), "") : "";
+    prefs.end();
+    return b;
+}
+
+// Parses a stored sequence. Returns false if the blob is malformed.
+bool seqParse(const String& blob, std::vector<SeqRow>& rows, int& reps) {
+    rows.clear();
+    reps = 1;
+    int ln = 0;
+    size_t pos = 0;
+    while (pos <= blob.length()) {
+        int nl = blob.indexOf('\n', pos);
+        size_t end = nl < 0 ? blob.length() : (size_t)nl;
+        String line = blob.substring(pos, end);
+        pos = end + 1;
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
+
+        if (ln == 0) {
+            if (line != "v1") return false;
+        } else if (ln == 2) {
+            reps = constrain((int)line.toInt(), 1, 999);
+        } else if (ln > 2 && line.length()) {
+            int sp = line.indexOf(' ');
+            if (sp < 0 || rows.size() >= SEQ_MAX_ROWS) return false;
+            SeqRow r;
+            r.delayMs = (uint32_t)constrain(line.substring(0, sp).toInt(), 0L, 86400000L);
+            r.text = pctDecode(line.substring(sp + 1));
+            r.text.replace("\\n", "\n");
+            r.text.replace("\\t", "\t");
+            rows.push_back(r);
+        }
+        ln++;
+    }
+    return ln >= 3;
+}
+
+String seqStart(int slot) {
+    if (slot < 1 || slot > SEQ_SLOTS) return "ERR:SEQ_SLOT";
+    std::vector<SeqRow> rows;
+    int reps;
+    if (!seqParse(seqLoadBlob(slot), rows, reps) || rows.empty()) return "ERR:SEQ_EMPTY";
+    seqRows    = std::move(rows);
+    seqReps    = reps;
+    seqRep     = 0;
+    seqRow     = 0;
+    seqChar    = 0;
+    seqWaiting = false;
+    seqSlot    = slot;
+    seqRunning = true;
+    seqResult  = "running";
+    return "OK:SEQ_RUN";
+}
+
+void seqStop(const char* why) {
+    if (!seqRunning) return;
+    seqRunning = false;
+    seqWaiting = false;
+    seqResult  = why;
+    seqRows.clear();
+    hid.releaseKeys();
+    lastJiggle = millis();   // don't jiggle the instant a sequence ends
+}
+
+// Non-blocking runner: types one character per call, then waits per row.
+void seqTick() {
+    if (!seqRunning) return;
+    if (!hid.isConnected()) { seqStop("disconnected"); return; }
+    uint32_t now = millis();
+
+    if (seqWaiting) {
+        if (now - seqWaitStart < seqWaitMs) return;
+        seqWaiting = false;
+        seqChar = 0;
+        if (++seqRow >= seqRows.size()) { seqRow = 0; seqRep++; }
+    }
+
+    const String& text = seqRows[seqRow].text;
+    if (seqChar < text.length()) {
+        if (now - seqLastChar < SEQ_CHAR_GAP_MS) return;
+        hid.typeChar(text[seqChar++]);
+        seqLastChar = millis();
+        return;
+    }
+
+    // Row finished typing
+    bool last = (seqRow + 1 >= seqRows.size()) && (seqRep + 1 >= seqReps);
+    if (last) { seqStop("done"); return; }
+    seqWaiting   = true;
+    seqWaitStart = now;
+    seqWaitMs    = seqRows[seqRow].delayMs;
+}
+
+// Commands that work without a BLE connection
+bool cmdNeedsConn(const String& c) {
+    return !c.startsWith("JIGGLE") && c != "STATUS" && c != "SEQ STOP";
+}
+
 // Commands:
 //   TYPE <text>           - type a string (\n and \t are parsed)
 //   KEY <keycode>         - press a raw HID keycode (decimal)
@@ -58,8 +210,17 @@ void saveJiggle() {
 //   JIGGLE MAX <ms>       - set maximum jiggle interval in ms
 //   JIGGLE STEP <px>      - set jiggle step size
 //   JIGGLE RAND <0|1>     - randomise direction
+//   SEQ RUN <1-5>         - run a saved sequence
+//   SEQ STOP              - stop the running sequence
 
 String handleCommand(const String& line) {
+    if (line.startsWith("SEQ ")) {
+        String sub = line.substring(4);
+        if (sub == "STOP") { seqStop("stopped"); return "OK:SEQ_STOP"; }
+        if (sub.startsWith("RUN ")) return seqStart(sub.substring(4).toInt());
+        return "ERR:UNKNOWN_SEQ";
+    }
+
     // LAYOUT command — no BLE connection required
     if (line.startsWith("LAYOUT ")) {
         String sub = line.substring(7);
@@ -149,9 +310,7 @@ void handleSerial() {
     line.trim();
     if (line.length() == 0) return;
 
-    // JIGGLE and STATUS work without BLE
-    bool needsConn = !line.startsWith("JIGGLE") && line != "STATUS";
-    if (needsConn && !hid.isConnected()) {
+    if (cmdNeedsConn(line) && !hid.isConnected()) {
         Serial.println("ERR:NOT_CONNECTED");
         return;
     }
@@ -160,7 +319,8 @@ void handleSerial() {
 
 // Web handlers
 void handleRoot() {
-    server.send_P(200, "text/html", PAGE_HTML);
+    server.sendHeader("Content-Encoding", "gzip");
+    server.send_P(200, "text/html", (const char*)PAGE_GZ, PAGE_GZ_LEN);
 }
 
 void handleStatus() {
@@ -187,7 +347,17 @@ void handleStatus() {
     }
     json += "],";
     json += "\"staIP\":\""    + (staConn ? WiFi.localIP().toString() : String("")) + "\",";
-    json += "\"staSSID\":\""  + (staConn ? WiFi.SSID() : String("")) + "\"";
+    json += "\"staSSID\":\""  + (staConn ? WiFi.SSID() : String("")) + "\",";
+    uint32_t seqLeft = seqWaiting ? (uint32_t)max(0L, (long)seqWaitMs - (long)(millis() - seqWaitStart)) : 0;
+    json += "\"seq\":{\"run\":" + String(seqRunning ? "true" : "false") +
+            ",\"slot\":"  + String(seqSlot) +
+            ",\"row\":"   + String(seqRow) +
+            ",\"rows\":"  + String(seqRows.size()) +
+            ",\"rep\":"   + String(seqRep) +
+            ",\"reps\":"  + String(seqReps) +
+            ",\"wait\":"  + String(seqWaiting ? "true" : "false") +
+            ",\"left\":"  + String(seqLeft) +
+            ",\"res\":\"" + seqResult + "\"}";
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", json);
@@ -201,8 +371,7 @@ void handleCmd() {
     String cmd = server.arg("plain");
     cmd.trim();
 
-    bool needsConn = !cmd.startsWith("JIGGLE") && cmd != "STATUS";
-    if (needsConn && !hid.isConnected()) {
+    if (cmdNeedsConn(cmd) && !hid.isConnected()) {
         server.send(200, "application/json", "{\"ok\":false,\"error\":\"NOT_CONNECTED\"}");
         return;
     }
@@ -297,14 +466,52 @@ void handleWifi() {
     server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Connecting...\"}");
 }
 
+// GET /seq — all stored sequences, separated by \x1e (empty = unused slot)
+void handleSeqList() {
+    String out;
+    for (int i = 1; i <= SEQ_SLOTS; i++) {
+        if (i > 1) out += '\x1e';
+        out += seqLoadBlob(i);
+    }
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "text/plain", out);
+}
+
+// POST /seq/save — body: "<slot>\n<blob>" (empty blob clears the slot)
+void handleSeqSave() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    String body = server.arg("plain");
+    int nl = body.indexOf('\n');
+    int slot = (nl < 0 ? body : body.substring(0, nl)).toInt();
+    String blob = nl < 0 ? "" : body.substring(nl + 1);
+    if (slot < 1 || slot > SEQ_SLOTS) {
+        server.send(400, "application/json", "{\"ok\":false,\"error\":\"BAD_SLOT\"}");
+        return;
+    }
+    if (blob.length() > SEQ_MAX_BLOB) {
+        server.send(200, "application/json", "{\"ok\":false,\"error\":\"TOO_LONG\"}");
+        return;
+    }
+    std::vector<SeqRow> rows;
+    int reps;
+    if (blob.length() && !seqParse(blob, rows, reps)) {
+        server.send(200, "application/json", "{\"ok\":false,\"error\":\"BAD_FORMAT\"}");
+        return;
+    }
+    prefs.begin("seqs", false);
+    if (blob.length()) prefs.putString(seqKey(slot).c_str(), blob);
+    else               prefs.remove(seqKey(slot).c_str());
+    prefs.end();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void wsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     if (type != WStype_TEXT) return;
     String cmd = String((char*)payload);
     cmd.trim();
     if (cmd.length() == 0) return;
 
-    bool needsConn = !cmd.startsWith("JIGGLE") && cmd != "STATUS";
-    if (needsConn && !hid.isConnected()) {
+    if (cmdNeedsConn(cmd) && !hid.isConnected()) {
         ws.sendTXT(num, "{\"ok\":false,\"error\":\"NOT_CONNECTED\"}");
         return;
     }
@@ -390,6 +597,8 @@ void setup() {
     server.on("/ble/connect", HTTP_POST, handleBleConnect);
     server.on("/ble/forget",  HTTP_POST, handleBleForget);
     server.on("/ble/name",    HTTP_POST, handleBleName);
+    server.on("/seq",         HTTP_GET,  handleSeqList);
+    server.on("/seq/save",    HTTP_POST, handleSeqSave);
     // Captive portal redirect — only for requests arriving on the AP interface
     server.onNotFound([]() {
         if (server.client().localIP() == WiFi.softAPIP()) {
@@ -422,9 +631,10 @@ void loop() {
     server.handleClient();
     ws.loop();
     handleSerial();
+    seqTick();
 
-    // Firmware jiggler — runs independently of browser
-    if (jiggling && hid.isConnected()) {
+    // Firmware jiggler — runs independently of browser (paused during sequences)
+    if (jiggling && hid.isConnected() && !seqRunning) {
         if (millis() - lastJiggle >= nextJiggleIn) {
             int8_t dx = jiggleRand ? (int8_t)(random(-jiggleStep, jiggleStep + 1)) : (int8_t)jiggleStep;
             int8_t dy = jiggleRand ? (int8_t)(random(-jiggleStep, jiggleStep + 1)) : 0;
