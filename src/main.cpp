@@ -16,6 +16,39 @@ WebSocketsServer ws(81);
 DNSServer        dns;
 Preferences      prefs;
 
+// Home WiFi (STA) — credentials persisted in NVS, retried in the background
+// when the link drops or the join at boot fails. Backs off from 30 s to 5 min
+// so a missing network doesn't keep disturbing clients on the device AP.
+#define STA_RETRY_MIN_MS  30000
+#define STA_RETRY_MAX_MS  300000
+String   staSSID, staPass;
+uint32_t staLastTry   = 0;
+uint32_t staRetryMs   = STA_RETRY_MIN_MS;
+bool     staWasUp     = false;
+
+void staKeepAlive() {
+    bool up = (WiFi.status() == WL_CONNECTED);
+    if (up != staWasUp) {
+        staWasUp = up;
+        if (up) {
+            Serial.printf("STA IP: %s\n", WiFi.localIP().toString().c_str());
+            staRetryMs = STA_RETRY_MIN_MS;
+        } else {
+            Serial.println("STA: link lost");
+            staLastTry = millis();   // give the driver's own reconnect a chance first
+        }
+    }
+    if (up || staSSID.length() == 0) return;
+    if (millis() - staLastTry < staRetryMs) return;
+
+    Serial.printf("STA: retrying %s (next in %us)\n", staSSID.c_str(),
+                  (unsigned)(min((uint32_t)STA_RETRY_MAX_MS, staRetryMs * 2) / 1000));
+    WiFi.disconnect(false);
+    WiFi.begin(staSSID.c_str(), staPass.c_str());
+    staLastTry = millis();
+    staRetryMs = min((uint32_t)STA_RETRY_MAX_MS, staRetryMs * 2);
+}
+
 // Keyboard layout (0=US, 1=UK) — persisted in NVS
 uint8_t kbLayout = 0;
 
@@ -451,6 +484,7 @@ void handleWifi() {
         prefs.remove("ssid");
         prefs.remove("pass");
         prefs.end();
+        staSSID = ""; staPass = "";   // stop background retries
         WiFi.disconnect();
         server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Disconnected\"}");
         return;
@@ -462,6 +496,9 @@ void handleWifi() {
     prefs.putString("pass", pass);
     prefs.end();
 
+    staSSID = ssid; staPass = pass;
+    staLastTry = millis();
+    staRetryMs = STA_RETRY_MIN_MS;
     WiFi.begin(ssid.c_str(), pass.c_str());
     server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Connecting...\"}");
 }
@@ -566,8 +603,8 @@ void setup() {
 
     // Try to connect to saved home WiFi
     prefs.begin("wifi", true);
-    String staSSID = prefs.getString("ssid", "");
-    String staPass = prefs.getString("pass", "");
+    staSSID = prefs.getString("ssid", "");
+    staPass = prefs.getString("pass", "");
     prefs.end();
 
     if (staSSID.length() > 0) {
@@ -579,8 +616,10 @@ void setup() {
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("STA IP: %s\n", WiFi.localIP().toString().c_str());
         } else {
-            Serial.println("STA: could not connect, AP only");
+            Serial.println("STA: could not connect yet, will keep retrying");
         }
+        staWasUp   = (WiFi.status() == WL_CONNECTED);
+        staLastTry = millis();
     }
 
     MDNS.begin("hid"); // accessible at http://hid.local on both AP and home network
@@ -632,6 +671,7 @@ void loop() {
     ws.loop();
     handleSerial();
     seqTick();
+    staKeepAlive();
 
     // Firmware jiggler — runs independently of browser (paused during sequences)
     if (jiggling && hid.isConnected() && !seqRunning) {
