@@ -61,7 +61,7 @@ pio device monitor   # serial console @ 115200
   - flash over serial instead. Copy `platformio.ini`, set `upload_protocol = esptool` in the copy, and run `pio run -c <copy> -t upload`.
 - **The board isn't detected at all (no `303a:1001` in `lsusb`).** Try a different USB-C cable, since charge-only cables are common. Or hold BOOT while plugging in.
 - **`No module named pip` / `MissingPackageManifestError` when PlatformIO installs tools.** A distro-packaged PlatformIO (e.g. Arch's `platformio`) runs on system Python without pip. Use PlatformIO in its own venv instead: `python -m venv ~/.platformio/penv && ~/.platformio/penv/bin/pip install platformio`, then use `~/.platformio/penv/bin/pio`.
-- **The web UI is slow, or the board sometimes doesn't join home WiFi at boot.** TX power is lowered to 8.5 dBm (`WIFI_POWER_8_5dBm`) to coexist with BLE, so the link is weak at range. The page is served gzipped (about 12 KB) to help. Moving the board closer to the router also helps. The `192.168.4.1` AP is always available as a fallback.
+- **The web UI is slow, or home WiFi is slow to join at boot.** The firmware retries the join in the background (30 s doubling to 5 min). TX power is lowered to 8.5 dBm (`WIFI_POWER_8_5dBm`) to coexist with BLE, so the link is weak at range. The page is served gzipped (about 12 KB) to help. Moving the board closer to the router also helps. The `192.168.4.1` AP is always available as a fallback.
 - **Testing `/cmd` or `/seq/save` with curl.** Send the body as `text/plain`, like the browser does: `curl -H 'Content-Type: text/plain' --data-binary 'STATUS' http://hid.local/cmd`. Plain `--data` sends form encoding, and the server answers `NO_BODY`.
 
 ## Command reference
